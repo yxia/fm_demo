@@ -10,7 +10,10 @@ import torch.nn as nn
 
 @dataclass
 class DataCfg:
-    k:int; n:int; r:float; comp_std:float; skew:float; noise_std:float; seed:int
+    k:int; n:int; noise_std:float; seed:int
+    layout:str="Ring (structured)"
+    r:float=2.3; comp_std:float=0.25; skew:float=0.8
+    mean_span:float=3.0; std_min:float=0.10; std_max:float=0.50; weight_alpha:float=0.7
 
 @dataclass
 class TrainCfg:
@@ -27,13 +30,19 @@ class VelNet(nn.Module):
     def forward(self,x,t): return self.net(torch.cat([x,t],dim=-1))
 
 def make_gmm(c:DataCfg):
-    """Create clean/noisy samples from a synthetic 2D Gaussian mixture."""
+    """Create clean/noisy samples from a 2D GMM (ring or randomized components)."""
     rng=np.random.default_rng(c.seed)
-    a=np.linspace(0,2*np.pi,c.k,endpoint=False)+rng.uniform(0,2*np.pi)
-    m=np.c_[c.r*np.cos(a),c.r*np.sin(a)] + rng.normal(0,0.15,(c.k,2))
-    logits=rng.normal(size=c.k)*c.skew; w=np.exp(logits-logits.max()); w/=w.sum()
+    if c.layout=="Randomized components":
+        m=rng.uniform(-c.mean_span,c.mean_span,size=(c.k,2))
+        s_min,s_max=sorted((c.std_min,c.std_max)); comp_stds=rng.uniform(s_min,max(s_max,s_min+1e-6),size=c.k)
+        w=rng.dirichlet(np.full(c.k,max(c.weight_alpha,1e-3)))
+    else:
+        a=np.linspace(0,2*np.pi,c.k,endpoint=False)+rng.uniform(0,2*np.pi)
+        m=np.c_[c.r*np.cos(a),c.r*np.sin(a)] + rng.normal(0,0.15,(c.k,2))
+        logits=rng.normal(size=c.k)*c.skew; w=np.exp(logits-logits.max()); w/=w.sum()
+        comp_stds=np.full(c.k,c.comp_std)
     comp=rng.choice(c.k,size=c.n,p=w)
-    clean=m[comp]+rng.normal(0,c.comp_std,(c.n,2)); noisy=clean+rng.normal(0,c.noise_std,clean.shape)
+    clean=m[comp]+rng.normal(0,comp_stds[comp][:,None],(c.n,2)); noisy=clean+rng.normal(0,c.noise_std,clean.shape)
     return clean.astype(np.float32), noisy.astype(np.float32), m, w
 
 def sw2d(x,y,nproj=64,seed=0):
@@ -81,16 +90,27 @@ def main():
     st.title("Flow Matching Demo: Noisy Gaussian Mixture")
     with st.sidebar:
         seed=st.number_input("Seed",0,999999,42,1); k=st.slider("# Components",2,10,4); n=st.slider("# Samples",300,6000,2000,100)
-        r=st.slider("Component separation",0.5,5.0,2.3); comp_std=st.slider("Target std",0.05,1.0,0.25)
-        skew=st.slider("Mixture imbalance",0.0,2.5,0.8); noise_std=st.slider("Observation noise std",0.0,2.0,0.7)
+        layout=st.radio("GMM layout",["Ring (structured)","Randomized components"])
+        if layout=="Randomized components":
+            mean_span=st.slider("Mean sampling span",0.5,6.0,3.0)
+            std_min=st.slider("Component std (min)",0.02,1.0,0.10)
+            std_max=st.slider("Component std (max)",0.03,1.5,0.50)
+            weight_alpha=st.slider("Weight concentration (Dirichlet α)",0.05,5.0,0.70)
+            r,comp_std,skew=2.3,0.25,0.8
+        else:
+            r=st.slider("Component separation",0.5,5.0,2.3); comp_std=st.slider("Target std",0.05,1.0,0.25)
+            skew=st.slider("Mixture imbalance",0.0,2.5,0.8)
+            mean_span,std_min,std_max,weight_alpha=3.0,0.10,0.50,0.70
+        noise_std=st.slider("Observation noise std",0.0,2.0,0.7)
         src=st.radio("Source",["Noisy observation -> Clean target","Standard Gaussian -> Clean target"])
         hidden=st.select_slider("Hidden width",options=[32,64,96,128,192],value=96); layers=st.slider("Layers",1,5,2)
         lr=st.select_slider("LR",options=[1e-4,2e-4,5e-4,1e-3,2e-3],value=1e-3); steps=st.slider("Train steps",100,4000,1200,100)
         batch=st.select_slider("Batch",options=[64,128,256,512,1024],value=256); integ=st.slider("Integration steps",10,200,80)
         run=st.button("Train / Retrain",type="primary")
-    clean,noisy,means,w=make_gmm(DataCfg(k,n,r,comp_std,skew,noise_std,int(seed)))
+    clean,noisy,means,w=make_gmm(DataCfg(k,n,noise_std,int(seed),layout,r,comp_std,skew,mean_span,std_min,std_max,weight_alpha))
     st.plotly_chart(fig_data(clean,noisy,means),use_container_width=True)
-    a,b,c=st.columns(3); a.metric("Noise",f"{noise_std:.2f}"); b.metric("Largest weight",f"{w.max():.2f}"); c.metric("Target std",f"{comp_std:.2f}")
+    a,b,c=st.columns(3); a.metric("Noise",f"{noise_std:.2f}"); b.metric("Largest weight",f"{w.max():.2f}")
+    c.metric("Target std",f"{comp_std:.2f}" if layout=="Ring (structured)" else f"{std_min:.2f}–{std_max:.2f}")
     if run:
         losses,start,gen=train_flow(clean,noisy,TrainCfg(src,hidden,layers,lr,steps,batch,integ),int(seed))
         st.session_state["res"]=(losses,start,gen,clean,sw2d(gen,clean,64,int(seed)+7))
